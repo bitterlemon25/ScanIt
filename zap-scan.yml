@@ -1,0 +1,162 @@
+name: ZAP Security Scan
+
+# Triggered on demand (by the Telegram bot, via the GitHub API)
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'URL to scan'
+        required: true
+      scan_type:
+        description: 'Type of scan: baseline (quick), full (deep), or api'
+        required: true
+        type: choice
+        options:
+          - baseline
+          - full
+          - api
+        default: full
+
+permissions:
+  contents: read
+
+jobs:
+  zap_scan:
+    runs-on: ubuntu-latest
+    steps:
+      # Only used for scan_type=api: tries to find an OpenAPI/Swagger spec
+      # under the given root URL, since ZAP's API scan needs a spec, not a page.
+      - name: Discover API spec (api scans only)
+        id: discover
+        if: ${{ github.event.inputs.scan_type == 'api' }}
+        run: |
+          BASE="${{ github.event.inputs.target_url }}"
+          BASE="${BASE%/}"
+          CANDIDATES=(
+            "$BASE/openapi.json"
+            "$BASE/v3/api-docs"
+            "$BASE/swagger.json"
+            "$BASE/api-docs"
+            "$BASE/api/openapi.json"
+            "$BASE/swagger/v1/swagger.json"
+          )
+          FOUND=""
+          for c in "${CANDIDATES[@]}"; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$c" || echo 000)
+            if [ "$code" = "200" ]; then
+              FOUND="$c"
+              break
+            fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "No spec auto-discovered, falling back to the given URL as-is." >&2
+            FOUND="$BASE"
+          fi
+          echo "Using spec: $FOUND"
+          echo "spec_url=$FOUND" >> "$GITHUB_OUTPUT"
+
+      - name: ZAP Baseline Scan (quick, passive-only)
+        if: ${{ github.event.inputs.scan_type == 'baseline' }}
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: ${{ github.event.inputs.target_url }}
+          cmd_options: '-j'
+          allow_issue_writing: false
+          fail_action: false
+
+      - name: ZAP Full Scan (deep, active)
+        if: ${{ github.event.inputs.scan_type == 'full' }}
+        uses: zaproxy/action-full-scan@v0.13.0
+        with:
+          target: ${{ github.event.inputs.target_url }}
+          # -a = include alpha-quality active scan rules for max coverage
+          # -j = also produce report_json.json, which we parse below
+          cmd_options: '-a -j'
+          allow_issue_writing: false
+          # Don't fail the job just because vulnerabilities were found —
+          # we want the run to succeed so the bot can fetch the report.
+          fail_action: false
+
+      - name: ZAP API Scan
+        if: ${{ github.event.inputs.scan_type == 'api' }}
+        uses: zaproxy/action-api-scan@v0.10.0
+        with:
+          target: ${{ steps.discover.outputs.spec_url }}
+          format: openapi
+          cmd_options: '-a -j'
+          allow_issue_writing: false
+          fail_action: false
+
+      - name: Convert ZAP JSON report into a clear plain-text report
+        env:
+          SCAN_TYPE: ${{ github.event.inputs.scan_type }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, collections
+
+          with open("report_json.json") as f:
+              data = json.load(f)
+
+          def strip_html(text):
+              if not text:
+                  return ""
+              text = re.sub(r"<[^>]+>", " ", text)
+              text = re.sub(r"\s+", " ", text)
+              return text.strip()
+
+          sites = data.get("site", [])
+          alerts = []
+          for site in sites:
+              for a in site.get("alerts", []):
+                  alerts.append(a)
+
+          risk_order = {"High": 0, "Medium": 1, "Low": 2, "Informational": 3}
+          alerts.sort(key=lambda a: risk_order.get(a.get("riskdesc", "").split(" ")[0], 4))
+
+          counts = collections.Counter(a.get("riskdesc", "").split(" ")[0] for a in alerts)
+
+          lines = []
+          lines.append("OWASP ZAP SCAN REPORT")
+          lines.append(f"Scan type: {os.environ.get('SCAN_TYPE', 'unknown')}")
+          lines.append(f"Target: {sites[0].get('@name','') if sites else 'unknown'}")
+          lines.append(f"Generated: {data.get('@generated','')}")
+          lines.append("")
+          lines.append("SUMMARY")
+          for risk in ["High", "Medium", "Low", "Informational"]:
+              lines.append(f"  {risk}: {counts.get(risk, 0)}")
+          lines.append(f"  TOTAL: {len(alerts)}")
+          lines.append("=" * 60)
+
+          if not alerts:
+              lines.append("")
+              lines.append("No alerts were found.")
+
+          for i, a in enumerate(alerts, 1):
+              instances = a.get("instances", [])
+              lines.append("")
+              lines.append(f"[{i}] {a.get('name','Unknown')}")
+              lines.append(f"Risk: {a.get('riskdesc','')}   |   Confidence: {a.get('confidence','')}")
+              lines.append("-" * 60)
+              lines.append(f"Description: {strip_html(a.get('desc',''))}")
+              lines.append(f"Solution: {strip_html(a.get('solution',''))}")
+              ref = strip_html(a.get("reference", ""))
+              if ref:
+                  lines.append(f"Reference: {ref}")
+              lines.append(f"Affected URLs ({len(instances)}):")
+              for inst in instances[:10]:
+                  param = f" | param: {inst.get('param')}" if inst.get("param") else ""
+                  lines.append(f"  - [{inst.get('method','')}] {inst.get('uri','')}{param}")
+              if len(instances) > 10:
+                  lines.append(f"  ...and {len(instances) - 10} more instance(s)")
+
+          with open("report.txt", "w") as f:
+              f.write("\n".join(lines))
+
+          print(f"Wrote report.txt with {len(alerts)} alert(s).")
+          PYEOF
+
+      - name: Upload plain-text report as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: report.txt

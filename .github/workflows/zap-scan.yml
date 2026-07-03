@@ -1,12 +1,26 @@
 name: ZAP Security Scan
 
-# Triggered on demand (by the Telegram bot, via the GitHub API)
+# Triggered on demand by the Telegram bot, via the GitHub API (workflow_dispatch).
+#
+# NOTE on secrets vs inputs:
+# callback_url and result_secret are deliberately NOT workflow_dispatch
+# inputs. Inputs are shown in plain text on the run's summary page to
+# anyone with read access to the repo (i.e. publicly, if the repo is
+# public). Since the callback URL and its secret never change between
+# runs, they belong in repository secrets instead:
+#
+#   Settings -> Secrets and variables -> Actions -> New repository secret
+#     RESULT_SECRET   same random value as the RESULT_SECRET env var on
+#                     the PythonAnywhere bot
+#     CALLBACK_URL    e.g. https://yourname.pythonanywhere.com/scan-complete/<RESULT_SECRET>
+#
 on:
   workflow_dispatch:
     inputs:
       target_url:
         description: 'URL to scan'
         required: true
+        type: string
       scan_type:
         description: 'Type of scan: baseline (quick), full (deep), or api'
         required: true
@@ -16,6 +30,14 @@ on:
           - full
           - api
         default: full
+      chat_id:
+        description: 'Telegram chat id to notify'
+        required: true
+        type: string
+      request_id:
+        description: 'Opaque id the bot uses to match this run to a chat message'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -28,9 +50,9 @@ jobs:
       # under the given root URL, since ZAP's API scan needs a spec, not a page.
       - name: Discover API spec (api scans only)
         id: discover
-        if: ${{ github.event.inputs.scan_type == 'api' }}
+        if: ${{ inputs.scan_type == 'api' }}
         run: |
-          BASE="${{ github.event.inputs.target_url }}"
+          BASE="${{ inputs.target_url }}"
           BASE="${BASE%/}"
           CANDIDATES=(
             "$BASE/openapi.json"
@@ -42,7 +64,7 @@ jobs:
           )
           FOUND=""
           for c in "${CANDIDATES[@]}"; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$c" || echo 000)
+            code=$(curl -s -o /dev/null -w "%{http_code}" -m 15 "$c" || echo 000)
             if [ "$code" = "200" ]; then
               FOUND="$c"
               break
@@ -56,29 +78,29 @@ jobs:
           echo "spec_url=$FOUND" >> "$GITHUB_OUTPUT"
 
       - name: ZAP Baseline Scan (quick, passive-only)
-        if: ${{ github.event.inputs.scan_type == 'baseline' }}
+        if: ${{ inputs.scan_type == 'baseline' }}
         uses: zaproxy/action-baseline@v0.15.0
         with:
-          target: ${{ github.event.inputs.target_url }}
+          target: ${{ inputs.target_url }}
           cmd_options: '-j'
           allow_issue_writing: false
           fail_action: false
 
       - name: ZAP Full Scan (deep, active)
-        if: ${{ github.event.inputs.scan_type == 'full' }}
+        if: ${{ inputs.scan_type == 'full' }}
         uses: zaproxy/action-full-scan@v0.13.0
         with:
-          target: ${{ github.event.inputs.target_url }}
+          target: ${{ inputs.target_url }}
           # -a = include alpha-quality active scan rules for max coverage
           # -j = also produce report_json.json, which we parse below
           cmd_options: '-a -j'
           allow_issue_writing: false
-          # Don't fail the job just because vulnerabilities were found —
+          # Don't fail the job just because vulnerabilities were found --
           # we want the run to succeed so the bot can fetch the report.
           fail_action: false
 
       - name: ZAP API Scan
-        if: ${{ github.event.inputs.scan_type == 'api' }}
+        if: ${{ inputs.scan_type == 'api' }}
         uses: zaproxy/action-api-scan@v0.10.0
         with:
           target: ${{ steps.discover.outputs.spec_url }}
@@ -88,14 +110,19 @@ jobs:
           fail_action: false
 
       - name: Convert ZAP JSON report into a clear plain-text report
+        # always() so we still produce *something* to send back to Telegram
+        # even if the scan step above failed outright (e.g. target
+        # unreachable, no spec found) rather than just finding 0 alerts.
+        if: always()
         env:
-          SCAN_TYPE: ${{ github.event.inputs.scan_type }}
+          SCAN_TYPE: ${{ inputs.scan_type }}
+          TARGET_URL: ${{ inputs.target_url }}
         run: |
           python3 - <<'PYEOF'
-          import json, os, re, collections
+          import json, os, re, collections, pathlib
 
-          with open("report_json.json") as f:
-              data = json.load(f)
+          scan_type = os.environ.get("SCAN_TYPE", "unknown")
+          target_url = os.environ.get("TARGET_URL", "unknown")
 
           def strip_html(text):
               if not text:
@@ -103,6 +130,26 @@ jobs:
               text = re.sub(r"<[^>]+>", " ", text)
               text = re.sub(r"\s+", " ", text)
               return text.strip()
+
+          report_json_path = pathlib.Path("report_json.json")
+          if not report_json_path.exists():
+              # The scan step didn't get far enough to produce a report.
+              with open("report.txt", "w") as f:
+                  f.write(
+                      "OWASP ZAP SCAN REPORT\n"
+                      f"Scan type: {scan_type}\n"
+                      f"Target: {target_url}\n\n"
+                      "No report_json.json was produced.\n"
+                      "This usually means the scan step failed before it could "
+                      "run -- for example the target was unreachable, or (for "
+                      "API scans) no OpenAPI/Swagger spec could be found.\n"
+                      "Check the GitHub Actions run logs for details.\n"
+                  )
+              print("report_json.json not found; wrote a fallback report.txt")
+              raise SystemExit(0)
+
+          with open(report_json_path) as f:
+              data = json.load(f)
 
           sites = data.get("site", [])
           alerts = []
@@ -117,8 +164,8 @@ jobs:
 
           lines = []
           lines.append("OWASP ZAP SCAN REPORT")
-          lines.append(f"Scan type: {os.environ.get('SCAN_TYPE', 'unknown')}")
-          lines.append(f"Target: {sites[0].get('@name','') if sites else 'unknown'}")
+          lines.append(f"Scan type: {scan_type}")
+          lines.append(f"Target: {sites[0].get('@name','') if sites else target_url}")
           lines.append(f"Generated: {data.get('@generated','')}")
           lines.append("")
           lines.append("SUMMARY")
@@ -156,7 +203,33 @@ jobs:
           PYEOF
 
       - name: Upload plain-text report as an artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: zap-report
           path: report.txt
+
+      - name: Notify PythonAnywhere
+        if: always()
+        env:
+          CALLBACK_URL: ${{ secrets.CALLBACK_URL }}
+          RESULT_SECRET: ${{ secrets.RESULT_SECRET }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          RUN_ID: ${{ github.run_id }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ -z "$CALLBACK_URL" ] || [ -z "$RESULT_SECRET" ]; then
+            echo "CALLBACK_URL / RESULT_SECRET repo secrets are not set; skipping callback." >&2
+            exit 0
+          fi
+          curl -sS -X POST "$CALLBACK_URL" \
+            -m 30 --retry 5 --retry-delay 5 --retry-connrefused \
+            -H "Content-Type: application/json" \
+            -H "X-Result-Secret: $RESULT_SECRET" \
+            -d "{
+              \"chat_id\": \"$CHAT_ID\",
+              \"request_id\": \"$REQUEST_ID\",
+              \"run_id\": \"$RUN_ID\",
+              \"status\": \"$JOB_STATUS\"
+            }"
